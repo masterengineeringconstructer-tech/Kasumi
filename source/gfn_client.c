@@ -507,7 +507,7 @@ bool gfn_begin_login(GfnClient *client, const char *provider_choice)
     client->catalog_vpc[0] = '\0';
     if (steam_link_selected()) {
         diagnostic_log("AUTH", "pairing with a PC (Steam Link)");
-        return steam_link_begin_login(client);
+        return steam_link_begin_login(client, provider_choice);
     }
     if (xcloud_selected()) {
         diagnostic_log("AUTH", "sign-in through Xbox Cloud Gaming");

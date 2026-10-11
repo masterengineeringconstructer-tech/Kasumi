@@ -1619,8 +1619,12 @@ static void draw_signin_top(const App *app)
     }
     static const char *const hints[] = { "A", "Set up", "B", "Home", "SELECT", "Settings", NULL };
     static const char *const retry_hints[] = { "A", "Try again", "B", "Home", "SELECT", "Settings", NULL };
-    if (!failed) draw_footer(UI_TOP_WIDTH, hints);
-    else ui_hint_row(200, 223, retry_hints);
+    /* Steam Link: X types the PC's address where the search can't find it. */
+    static const char *const steam_hints[] = { "A", "Set up", "X", "PC address", "B", "Home", NULL };
+    static const char *const steam_retry_hints[] = { "A", "Try again", "X", "PC address", "B", "Home", NULL };
+    const bool steam = s == SERVICE_STEAM;
+    if (!failed) draw_footer(UI_TOP_WIDTH, steam ? steam_hints : hints);
+    else ui_hint_row(200, 223, steam ? steam_retry_hints : retry_hints);
 }
 
 /* A sign-in in progress through Xbox Cloud Gaming (Microsoft's code). */
@@ -1957,7 +1961,7 @@ static void draw_library_top(const App *app, bool entering)
     }
     /* L and R sit beside the tabs, so the row stays short enough for 15 px. */
     static const char *const hints[] = { "◀ ▶", "Browse", "A", "Open", "X", "Search", "B", "Home", NULL };
-    static const char *const pc_hints[] = { "A", "Choose", "B", "Close", NULL };
+    static const char *const pc_hints[] = { "A", "Choose", "X", "PC address", "B", "Close", NULL };
     static const char *const search_hints[] = { "◀ ▶", "Browse", "A", "Open", "X", "Search", "B", "Library",
                                                 NULL };
     draw_footer(UI_TOP_WIDTH, app->pc_sheet_open ? pc_hints : searching ? search_hints : hints);

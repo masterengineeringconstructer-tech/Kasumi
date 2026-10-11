@@ -21,5 +21,9 @@ int steam_udp_recv(int sock, void *data, size_t cap, uint32_t *ip, uint16_t *por
 bool steam_udp_wait(int sock, int timeout_ms);
 /* The local network's broadcast address (255.255.255.255 if unknown). */
 uint32_t steam_udp_broadcast(void);
+/* This device's address on the network (0 when it has none) and its mask. */
+uint32_t steam_udp_local_ip(uint32_t *mask);
+/* The error behind the last failed socket call. */
+int steam_udp_error(void);
 uint32_t steam_ip_parse(const char *text);
 void steam_ip_format(uint32_t ip, char *out, size_t size);

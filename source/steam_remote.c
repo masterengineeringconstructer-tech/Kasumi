@@ -119,9 +119,17 @@ static bool parse_status(const Message *m, uint32_t ip, SteamHost *host)
 int steam_discover(const SteamIdentity *id, uint32_t ip, SteamHost *hosts, int max, unsigned timeout_ms)
 {
     const int sock = steam_udp_open();
-    if (sock == STEAM_UDP_INVALID) return 0;
+    if (sock == STEAM_UDP_INVALID) {
+        diagnostic_log("STEAM", "search: no socket (error %d)", steam_udp_error());
+        return 0;
+    }
     int found = 0;
     uint32_t seq = 0;
+    /* For the log when nothing answers (reports MKAX9F and others: a PC
+     * on the same Wi-Fi that never showed up, and no way to tell why). */
+    unsigned asks = 0, failed_sends = 0, other_packets = 0;
+    int send_error = 0;
+    const uint32_t broadcast = steam_udp_broadcast();
     const uint64_t end = steam_now_ms() + timeout_ms;
     uint64_t next_send = 0;
     while (steam_now_ms() < end && found < max) {
@@ -131,12 +139,15 @@ int steam_discover(const SteamIdentity *id, uint32_t ip, SteamHost *hosts, int m
             PbWriter w;
             pb_writer(&w, body, sizeof(body));
             pb_varint(&w, 1, seq++);
-            if (ip) {
-                send_message(sock, ip, id->device_id, MSG_DISCOVERY, &w);
-            } else {
-                /* Both: some routers drop one or the other. */
-                send_message(sock, steam_udp_broadcast(), id->device_id, MSG_DISCOVERY, &w);
-                send_message(sock, 0xFFFFFFFFu, id->device_id, MSG_DISCOVERY, &w);
+            /* Both broadcasts: some routers drop one or the other. */
+            const uint32_t targets[2] = { ip ? ip : broadcast, ip ? 0 : 0xFFFFFFFFu };
+            for (int t = 0; t < 2; ++t) {
+                if (!targets[t] || (t && targets[t] == targets[0])) continue;
+                ++asks;
+                if (!send_message(sock, targets[t], id->device_id, MSG_DISCOVERY, &w)) {
+                    ++failed_sends;
+                    send_error = steam_udp_error();
+                }
             }
             next_send = now + 400;
         }
@@ -147,7 +158,10 @@ int steam_discover(const SteamIdentity *id, uint32_t ip, SteamHost *hosts, int m
         while ((n = steam_udp_recv(sock, packet, sizeof(packet), &from, NULL)) > 0) {
             Message m;
             SteamHost host;
-            if (!parse(packet, (size_t)n, &m) || m.type != MSG_STATUS || !parse_status(&m, from, &host)) continue;
+            if (!parse(packet, (size_t)n, &m) || m.type != MSG_STATUS || !parse_status(&m, from, &host)) {
+                ++other_packets;
+                continue;
+            }
             bool seen = false;
             for (int i = 0; i < found; ++i) seen |= hosts[i].client_id == host.client_id;
             if (!seen && found < max) {
@@ -162,6 +176,17 @@ int steam_discover(const SteamIdentity *id, uint32_t ip, SteamHost *hosts, int m
         if (ip && found) break;
     }
     steam_udp_close(sock);
+    if (!found) {
+        uint32_t mask;
+        const uint32_t self = steam_udp_local_ip(&mask);
+        char to[20], me[20], net[20];
+        steam_ip_format(ip ? ip : broadcast, to, sizeof(to));
+        steam_ip_format(self, me, sizeof(me));
+        steam_ip_format(mask, net, sizeof(net));
+        diagnostic_log("STEAM", "search: no answer in %u ms from %s%s; asks=%u failed=%u (error %d) "
+                       "otherPackets=%u; this 3DS %s mask %s", timeout_ms, to, ip ? "" : " and 255.255.255.255",
+                       asks, failed_sends, send_error, other_packets, me, net);
+    }
     return found;
 }
 

@@ -545,6 +545,26 @@ static void begin_login(void)
     submit_job(NET_JOB_BEGIN_LOGIN, busy[current_service()], g_app.settings.provider, NULL);
 }
 
+/* Steam Link: the PC's address, typed in, for networks where the search
+ * broadcast never reaches it (guest Wi-Fi, mesh routers, a firewall). */
+static void steam_type_address(void)
+{
+    char text[20];
+    steam_link_typed_address(text, sizeof(text));
+    swkbdInit(&g_search_keyboard, SWKBD_TYPE_NUMPAD, 2, 15);
+    swkbdSetNumpadKeys(&g_search_keyboard, '.', 0);
+    swkbdSetHintText(&g_search_keyboard, "Your PC's IPv4 address");
+    swkbdSetButton(&g_search_keyboard, SWKBD_BUTTON_LEFT, "Cancel", false);
+    swkbdSetButton(&g_search_keyboard, SWKBD_BUTTON_RIGHT, "Find PC", true);
+    swkbdSetValidation(&g_search_keyboard, SWKBD_NOTEMPTY_NOTBLANK, 0, 0);
+    swkbdSetFeatures(&g_search_keyboard, SWKBD_DARKEN_TOP_SCREEN);
+    if (text[0]) swkbdSetInitialText(&g_search_keyboard, text);
+    if (swkbdInputText(&g_search_keyboard, text, sizeof(text)) != SWKBD_BUTTON_RIGHT) return;
+    char choice[24];
+    snprintf(choice, sizeof(choice), "pc:%s", text);
+    submit_job(NET_JOB_BEGIN_LOGIN, "Asking that address for Steam...", choice, NULL);
+}
+
 static void load_library(void)
 {
     static const char *const busy[SERVICE_COUNT] = {
@@ -1679,6 +1699,11 @@ static void handle_pc_sheet(u32 down, u32 repeat, AppAction action)
     int pick = -1;
     if (action == ACTION_PC_ROW) pick = g_app.pc_index = screens_touched_pc();
     else if (down & KEY_A) pick = g_app.pc_index;
+    if (down & KEY_X) {
+        g_app.pc_sheet_open = false;
+        steam_type_address();
+        return;
+    }
     if (pick < 0) return;
     if (pick == count + 2) {
         g_app.pc_sheet_open = false;
@@ -1726,6 +1751,7 @@ static void handle_library(u32 down, u32 repeat, AppAction action)
     if (!gfn_has_session(&g_client)) {
         /* This service's sign-in card. */
         if ((down & KEY_A) || action == ACTION_SIGN_IN) sign_in();
+        else if ((down & KEY_X) && current_service() == SERVICE_STEAM) steam_type_address();
         else if (down & KEY_B) go_home();
         else if ((down & KEY_SELECT) || action == ACTION_SETTINGS) {
             g_app.settings_open = true;

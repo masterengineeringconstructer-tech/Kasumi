@@ -40,6 +40,14 @@ void steam_udp_close(int sock)
 
 uint32_t steam_udp_broadcast(void) { return 0xFFFFFFFFu; }
 
+uint32_t steam_udp_local_ip(uint32_t *mask)
+{
+    if (mask) *mask = 0;
+    return 0;
+}
+
+int steam_udp_error(void) { return WSAGetLastError(); }
+
 #else
 #include <3ds.h>
 #include <arpa/inet.h>
@@ -81,6 +89,17 @@ uint32_t steam_udp_broadcast(void)
         return ntohl(broadcast.s_addr);
     return 0xFFFFFFFFu;
 }
+
+uint32_t steam_udp_local_ip(uint32_t *mask)
+{
+    struct in_addr ip, netmask, broadcast;
+    if (mask) *mask = 0;
+    if (R_FAILED(SOCU_GetIPInfo(&ip, &netmask, &broadcast))) return 0;
+    if (mask) *mask = ntohl(netmask.s_addr);
+    return ntohl(ip.s_addr);
+}
+
+int steam_udp_error(void) { return errno; }
 #endif
 
 bool steam_udp_send(int sock, uint32_t ip, uint16_t port, const void *data, size_t size)

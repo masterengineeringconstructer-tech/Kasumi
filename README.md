@@ -179,7 +179,8 @@ checked against the release's SHA256SUMS before anything is installed.
      (the default); if you bought it from a local partner, first pick it in
      **Settings > Account > GeForce NOW provider**.
    - **Steam Link**: start Steam on your PC. Kasumi finds it on your Wi-Fi and
-     shows a code; type it into the window Steam opens on the PC.
+     shows a code; type it into the window Steam opens on the PC. If it isn't
+     found, press **X** and type the PC's address instead.
 3. Your games appear on the shelf. Press **A** on one to open it, then **A**
    again to play. **B** goes back to the hub, where the other services wait.
 4. During play, hold **START + SELECT** for the stream menu.
@@ -260,6 +261,13 @@ two services need no PC at all.
 Some PC games only take keyboard and mouse, like Minecraft Java Edition. In
 Steam on the PC, turn on Steam Input for that game and pick a keyboard and
 mouse layout, or add a controller mod (Controlify, for Minecraft).
+
+**Kasumi can't find my PC (Steam Link).**
+Some routers, guest networks and PC firewalls block the search. Press **X** on
+the Steam Link card (or Y, then X, once paired) and type your PC's IPv4
+address: run `ipconfig` on the PC and look for a number like 192.168.1.20. If
+nothing answers there either, set the PC's network to *Private* in Windows'
+network settings, or allow Steam through Windows Firewall.
 
 **Do I need a paid GeForce NOW membership?**
 No. The free tier works, with a queue before each session and a one-hour

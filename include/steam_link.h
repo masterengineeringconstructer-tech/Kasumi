@@ -28,7 +28,11 @@ void steam_link_select(bool steam);
 bool steam_link_selected(void);
 
 bool steam_link_load_login(GfnClient *client);
-bool steam_link_begin_login(GfnClient *client);
+/* choice "pc:<address>" asks one typed-in address instead of searching. */
+bool steam_link_begin_login(GfnClient *client, const char *choice);
+/* The address to offer on the keyboard: the one typed before, or the
+ * paired PC's (empty when there is none). */
+void steam_link_typed_address(char *out, size_t size);
 void steam_link_login_tick(GfnClient *client);
 bool steam_link_fetch_library(GfnClient *client);
 bool steam_link_search(GfnClient *client, const char *query);

@@ -54,6 +54,9 @@ static struct {
     SteamPairing pair;
     /* The stream the PC granted, for steam_link_signal_start. */
     SteamStreamGrant grant;
+    /* A PC address typed in, for networks that drop the search broadcast
+     * (guest Wi-Fi, mesh routers, a PC firewall): asked directly. */
+    uint32_t typed_ip;
 } g;
 
 static LightLock g_lock;
@@ -82,6 +85,16 @@ void steam_link_select(bool steam)
 bool steam_link_selected(void) { return g_selected; }
 
 const char *steam_link_host_name(void) { return g_host_name; }
+
+static void load(void);
+
+void steam_link_typed_address(char *out, size_t size)
+{
+    load();
+    const uint32_t ip = g.typed_ip ? g.typed_ip : g.paired ? g.host.ip : 0;
+    if (ip) steam_ip_format(ip, out, size);
+    else if (size) out[0] = '\0';
+}
 
 bool steam_link_saved_pc(char *name, size_t size)
 {
@@ -204,6 +217,11 @@ static void save(void)
     g.recent_dirty = false;
     LightLock_Unlock(&g_lock);
     json_object_set_new(root, "hosts", hosts);
+    if (g.typed_ip) {
+        char typed[20];
+        steam_ip_format(g.typed_ip, typed, sizeof(typed));
+        json_object_set_new(root, "pc_address", json_string(typed));
+    }
     if (json_dump_file(root, SL_PATH, JSON_COMPACT) != 0) diagnostic_log("STEAM", "saving the pairing failed");
     json_decref(root);
 }
@@ -217,6 +235,7 @@ static void load(void)
     if (json_is_object(root)) {
         g.id.device_id = u64_of(root, "device_id");
         unhex(text_of(root, "device_secret"), g.id.secret, 32);
+        g.typed_ip = steam_ip_parse(text_of(root, "pc_address"));
         json_t *hosts = json_object_get(root, "hosts");
         LightLock_Lock(&g_lock);
         g.paired = false;
@@ -357,27 +376,72 @@ bool steam_link_use_pc(GfnClient *c, unsigned index)
 
 /* ---- Pairing (the sign-in) ------------------------------------------------------- */
 
-bool steam_link_begin_login(GfnClient *c)
+/* A search that came back empty: the sign-in card says why, or (another
+ * PC being paired) a notice does and the one in use stays. */
+static bool login_failed(GfnClient *c, const char *why)
+{
+    c->auth_state = g.paired ? GFN_AUTH_LOGGED_IN : GFN_AUTH_ERROR;
+    snprintf(c->status, sizeof(c->status), "%.159s", why);
+    return false;
+}
+
+/* A paired PC answered at a typed address: just remember where it is. */
+static bool update_paired_address(GfnClient *c, const SteamHost *found)
+{
+    SteamHost *known = g.paired && found->client_id == g.host.client_id ? &g.host : NULL;
+    for (unsigned k = 0; !known && k < g.other_count; ++k)
+        if (found->client_id == g.others[k].host.client_id) known = &g.others[k].host;
+    if (!known) return false;
+    known->ip = found->ip;
+    save();
+    char address[20];
+    steam_ip_format(found->ip, address, sizeof(address));
+    snprintf(c->status, sizeof(c->status), "Found %.40s at %s", found->name, address);
+    diagnostic_log("STEAM", "paired PC found at its typed address");
+    c->auth_state = GFN_AUTH_LOGGED_IN;
+    return true;
+}
+
+bool steam_link_begin_login(GfnClient *c, const char *choice)
 {
     load();
     if (g.pairing) steam_pair_cancel(&g.pair);
     g.pairing = false;
     provider_steam(&c->login_provider);
+    /* "pc:<address>": typed on the keyboard (Steam Link's X). */
+    const char *typed = choice && !strncmp(choice, "pc:", 3) ? choice + 3 : NULL;
+    if (!steam_udp_local_ip(NULL))
+        return login_failed(c, "This 3DS isn't connected to Wi-Fi. Connect it, then try again.");
+    if (typed) {
+        const uint32_t ip = steam_ip_parse(typed);
+        if (!ip || (ip >> 24) == 0 || (ip >> 24) >= 224 || (ip >> 24) == 127) {
+            char why[160];
+            snprintf(why, sizeof(why), "\"%.20s\" isn't a PC address. It looks like 192.168.1.20.", typed);
+            return login_failed(c, why);
+        }
+        g.typed_ip = ip;
+        save();
+        diagnostic_log("STEAM", "searching at a typed address");
+    }
     snprintf(c->status, sizeof(c->status), "Looking for a PC running Steam on this Wi-Fi...");
     SteamHost hosts[4];
-    const int found = steam_discover(&g.id, 0, hosts, 4, 2000);
-    if (!found && g.paired) {
-        /* Pairing another PC: stay on the one paired before. */
-        c->auth_state = GFN_AUTH_LOGGED_IN;
-        snprintf(c->status, sizeof(c->status), "No other PC with Steam found on this Wi-Fi.");
-        return false;
+    int found = typed ? steam_discover(&g.id, g.typed_ip, hosts, 1, 3000) : 0;
+    if (typed && !found) {
+        char why[160], address[20];
+        steam_ip_format(g.typed_ip, address, sizeof(address));
+        snprintf(why, sizeof(why), "Nothing with Steam answered at %s. Check the address and that Steam is "
+                 "running there.", address);
+        return login_failed(c, why);
     }
-    if (!found) {
-        c->auth_state = GFN_AUTH_ERROR;
-        snprintf(c->status, sizeof(c->status), "No PC with Steam found on this Wi-Fi. Start Steam on your PC, "
-                 "check Remote Play is on in its settings, then press X.");
-        return false;
-    }
+    if (typed && update_paired_address(c, &hosts[0])) return false;
+    /* 5 s: a PC on Wi-Fi power saving can be slow to hear a broadcast.
+     * Then the address typed before, where broadcasts don't get through. */
+    if (!found) found = steam_discover(&g.id, 0, hosts, 4, 5000);
+    if (!found && g.typed_ip) found = steam_discover(&g.id, g.typed_ip, hosts, 1, 1500);
+    if (!found && g.paired) return login_failed(c, "No other PC with Steam found. Press X to type its address.");
+    if (!found)
+        return login_failed(c, "No PC with Steam answered on this Wi-Fi. Start Steam on your PC, or press X to "
+                               "type its address.");
     /* A PC not paired yet first (pairing another), then one with someone
      * signed in to Steam. */
     int pick = -1;
@@ -614,7 +678,10 @@ static bool find_host(SteamHost *host)
     if (g.host.ip && steam_discover(&g.id, g.host.ip, host, 1, 1200) == 1 && host->client_id == g.host.client_id)
         return true;
     SteamHost hosts[8];
-    const int found = steam_discover(&g.id, 0, hosts, 8, 2000);
+    /* The typed address (the PC's may have changed since), then everyone. */
+    int found = 0;
+    if (g.typed_ip && g.typed_ip != g.host.ip) found = steam_discover(&g.id, g.typed_ip, hosts, 1, 1200);
+    if (!found || hosts[0].client_id != g.host.client_id) found = steam_discover(&g.id, 0, hosts, 8, 5000);
     for (int i = 0; i < found; ++i) {
         if (hosts[i].client_id != g.host.client_id) continue;
         *host = hosts[i];
@@ -641,8 +708,8 @@ bool steam_link_start_session(GfnClient *c, const GfnGame *game)
     SteamHost host;
     if (!find_host(&host)) {
         char text[160];
-        snprintf(text, sizeof(text), "%.40s isn't answering. Is it on, with Steam running, on the same Wi-Fi?",
-                 g.host.name);
+        snprintf(text, sizeof(text), "%.40s isn't answering. Is it on, with Steam running? If its address "
+                 "changed: Y, then X to type it.", g.host.name);
         session_failed(c, text, "offline");
         return false;
     }
