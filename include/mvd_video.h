@@ -15,10 +15,18 @@ bool mvd_video_init(unsigned input_width, unsigned input_height);
  * NAL by NAL decodes (XG8Z77: 101 s of Xbox 720p): NAL renders full size
  * for the CPU to scale on the media thread, NAL_SHRINK has MVD scale to the
  * wide 800x480 pipeline (own thread, GPU). */
-enum { MVD_HD_GUARDED, MVD_HD_SHRINK, MVD_HD_NAL, MVD_HD_WHOLE, MVD_HD_NAL_SHRINK };
+/* NAL_HALF: as NAL_SHRINK but to 640x352, which the GPU scales up: build
+ * 144 decoded 720p in 14.2 ms at full size but 21.7 ms shrunk to 800x480. */
+enum { MVD_HD_GUARDED, MVD_HD_SHRINK, MVD_HD_NAL, MVD_HD_WHOLE, MVD_HD_NAL_SHRINK, MVD_HD_NAL_HALF };
 void mvd_video_set_hd_mode(int mode);
+/* 720p: size MVD's work buffer for a higher H.264 level than the stream's
+ * 3.2 (4.2 down to 4.0, what memory allows). Test for the mvd crash on big
+ * keyframes (Asphalt 9's 27 KB IDR, crash dump 42). Set before init. */
+void mvd_video_set_big_work(bool big);
 /* The decoder refused a frame and stopped taking any. */
 bool mvd_video_failed(void);
+/* Decoding a stream above 960x544 (Xbox's 720p). */
+bool mvd_video_hd(void);
 /* True while decoding for the 800-column wide screen via the GPU. */
 bool mvd_video_wide(void);
 /* The picture inside the wide surface: 800x480, or smaller for a stream
@@ -37,6 +45,11 @@ void mvd_video_skip_oldest_frame(void);
 /* Encoded size of the index-th ready frame (0 = oldest): a small P-frame
  * means little changed on screen, so it is the least visible one to drop. */
 size_t mvd_video_ready_frame_bytes(unsigned index);
+/* How long a ready frame has waited to be shown, in microseconds. */
+unsigned mvd_video_ready_frame_age_us(unsigned index);
+/* Xbox 720p: keep the next 60 fps frame instead of the one after (the 30
+ * shown move 17 ms later, so they wait 17 ms less to be shown). */
+void mvd_video_hd_skip_one(void);
 /* Discard one decoded frame anywhere in the ready queue. */
 void mvd_video_skip_ready_frame(unsigned index);
 /* Skip decoding until the next IDR (a frame was lost upstream). */

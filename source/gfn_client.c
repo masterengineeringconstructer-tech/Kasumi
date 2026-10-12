@@ -702,7 +702,8 @@ static bool fetch_catalog(GfnClient *client, const char *search_query, bool owne
      * filter and sorted by catalog relevance, so games that were never added
      * to the account showed up as "library". */
     #define APP_FIELDS "items{id title images{GAME_BOX_ART KEY_ART TV_BANNER HERO_IMAGE} " \
-        "variants{id appStore gfn{library{status selected lastPlayedDate}}}}" \
+        "variants{id appStore gfn{library{status selected lastPlayedDate}}} " \
+        "gfn{playabilityState minimumMembershipTierLabel}}" \
         "pageInfo{hasNextPage endCursor totalCount}"
     static const char *browse_query =
         "query GetLibraryApps($vpcId:String!,$locale:String!,$sortString:String!,$fetchCount:Int!,$cursor:String!,$filters:AppFilterFields!){"
@@ -715,6 +716,10 @@ static bool fetch_catalog(GfnClient *client, const char *search_query, bool owne
     #undef APP_FIELDS
     char cursor[256] = "";
     unsigned returned = 0, skipped = 0;
+    /* Membership: games for paid tiers only, and the ones this account
+     * can't play. A free game marked unplayable means NVIDIA answered
+     * without the account (every game reads unplayable then). */
+    unsigned premium = 0, needs_paid = 0, playable = 0, unpersonal = 0;
     for (int page = 0; page < 8 && client->game_count < GFN_MAX_GAMES; ++page) {
     json_t *body_root = json_object();
     json_t *variables = json_object();
@@ -805,6 +810,16 @@ static bool fetch_catalog(GfnClient *client, const char *search_query, bool owne
             json_t *store = json_object_get(chosen, "appStore");
             if (json_is_string(store)) snprintf(game->store, sizeof(game->store), "%s", json_string_value(store));
         }
+        json_t *gfn = json_object_get(item, "gfn");
+        json_t *tier = json_is_object(gfn) ? json_object_get(gfn, "minimumMembershipTierLabel") : NULL;
+        json_t *playability = json_is_object(gfn) ? json_object_get(gfn, "playabilityState") : NULL;
+        const char *state = json_is_string(playability) ? json_string_value(playability) : "";
+        game->premium = json_is_string(tier) && json_string_value(tier)[0];
+        game->needs_paid = !strcmp(state, "UNPLAYABLE_DUE_TO_UPGRADE");
+        premium += game->premium;
+        needs_paid += game->needs_paid;
+        playable += !strcmp(state, "PLAYABLE");
+        unpersonal += game->needs_paid && !game->premium;
         /* All launchable store versions, for the details page. */
         json_array_foreach(variants, variant_index, variant) {
             if (game->variant_count >= GFN_MAX_VARIANTS) break;
@@ -854,6 +869,10 @@ static bool fetch_catalog(GfnClient *client, const char *search_query, bool owne
     diagnostic_log("CATALOG", "%s returned=%u kept=%lu skippedNotInLibrary=%u total=%lu",
                    search_query ? "search" : "library", returned, (unsigned long)client->game_count,
                    skipped, (unsigned long)client->catalog_total);
+    diagnostic_log("CATALOG", "membership premium=%u needsPaid=%u playable=%u unpersonal=%u", premium, needs_paid,
+                   playable, unpersonal);
+    if (unpersonal)
+        for (size_t i = 0; i < client->game_count; ++i) client->games[i].needs_paid = false;
     if (search_query) {
         snprintf(client->status, sizeof(client->status), "Search %.50s: %lu results",
                  search_query, (unsigned long)client->game_count);
@@ -947,10 +966,11 @@ static void library_save(const GfnClient *client)
         json_t *variants = json_array();
         for (unsigned v = 0; v < g->variant_count; ++v)
             json_array_append_new(variants, json_pack("[s,s]", g->variants[v].id, g->variants[v].store));
-        json_array_append_new(games, json_pack("{s:s,s:s,s:s,s:s,s:s,s:o,s:i}", "title", g->title,
+        json_array_append_new(games, json_pack("{s:s,s:s,s:s,s:s,s:s,s:o,s:i,s:b,s:b}", "title", g->title,
                                                "id", g->app_id, "store", g->store,
                                                "image", g->image_url, "wide", g->wide_url, "variants", variants,
-                                               "selected", (int)g->variant_selected));
+                                               "selected", (int)g->variant_selected, "premium", g->premium,
+                                               "needs_paid", g->needs_paid));
     }
     json_t *root = json_pack("{s:I,s:o}", "saved_at", (json_int_t)client->library_saved_at,
                              "games", games);
@@ -992,6 +1012,8 @@ bool gfn_library_load(GfnClient *client)
         json_t *selected = json_object_get(item, "selected");
         if (json_is_integer(selected) && (unsigned)json_integer_value(selected) < g->variant_count)
             g->variant_selected = (unsigned)json_integer_value(selected);
+        g->premium = json_is_true(json_object_get(item, "premium"));
+        g->needs_paid = json_is_true(json_object_get(item, "needs_paid"));
         if (g->title[0] && g->app_id[0]) ++client->game_count;
     }
     json_t *saved = json_object_get(root, "saved_at");

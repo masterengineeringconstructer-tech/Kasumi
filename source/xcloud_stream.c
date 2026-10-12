@@ -216,6 +216,8 @@ static void send_configuration(WebRtcTransport *t, PeerConnection *pc)
      * a 1080p one to shrink (2026-10-07: 800x480 came at 60 fps). Classic
      * mode has the decoder shrink it to 400x240. */
     const int w = XCLOUD_STREAM_WIDTH, h = XCLOUD_STREAM_HEIGHT;
+    /* The web player lifts any title constraint once connected. */
+    send_message(pc, "TransactionStart", "/streaming/title/constrain", json_pack("{s:b}", "constrain", 0));
     send_message(pc, "Message", "/streaming/characteristics/dimensionschanged",
                  json_pack("{s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:b}", "horizontal", w, "vertical", h,
                            "preferredWidth", w, "preferredHeight", h, "safeAreaLeft", 0, "safeAreaTop", 0,

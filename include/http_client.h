@@ -33,6 +33,8 @@ void http_cancel(void);
  * progress callback (bytes received, bytes expected or 0). */
 typedef void (*HttpProgress)(unsigned long long received, unsigned long long total, void *context);
 void http_next_request(long timeout_seconds, HttpProgress progress, void *context);
+/* While a stream plays: requests never sit in a blocking socket call. */
+void http_set_gentle(bool on);
 char *http_url_encode(const char *value);
 /* The console clock is clearly wrong (before this build, or years ahead),
  * so certificates cannot be checked and HTTPS fails. Writes the date the

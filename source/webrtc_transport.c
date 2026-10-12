@@ -10,6 +10,7 @@
 #include "xcloud.h"
 #include "steam_link.h"
 #include "steam_session.h"
+#include "http_client.h"
 
 #include "peer.h"
 #include "peer_connection.h"
@@ -500,10 +501,10 @@ static void on_video(const PeerVideoPacket *packet, void *userdata)
      * ~3 s, but sometimes 6 or 11 (1.0.3 export: a 6 s limit cut it off), so
      * 15 s. Once a picture has shown, a bigger stretch only holds it. Some
      * games send even more (Dragon Ball Xenoverse 2: 2560x1440). */
-    const int test = t->xcloud ? xcloud_experiment() : 0;
-    const bool decode_720p_test = (test == XCLOUD_TEST_720P_SHRINK || test == XCLOUD_TEST_720P_FULL) &&
-                                  decode_width == 1280 && decode_height == 720;
-    if (t->xcloud && !decode_720p_test) {
+    /* Build 146: decoded at half size instead (xcloud_decode_720p). */
+    const bool decode_720p = t->xcloud && xcloud_decode_720p() &&
+                             decode_width == 1280 && decode_height == 720;
+    if (t->xcloud && !decode_720p) {
         const uint64_t now = osGetTime();
         if (decode_width <= 960 && decode_height <= 544) {
             t->xcloud_hd_since = 0;
@@ -511,16 +512,13 @@ static void on_video(const PeerVideoPacket *packet, void *userdata)
             if (!t->xcloud_hd_since) t->xcloud_hd_since = now;
             const bool shown = mvd_video_active() && mvd_video_decoded_frames();
             if (now - t->xcloud_hd_since >= 15000 && !shown && !t->no_reconnect) {
-                diagnostic_flag("xcloud-720p", "the game stayed at %ux%u (test %d)", source_width, source_height, test);
-                if (test)
-                    snprintf(t->status, sizeof(t->status), "Test %d (%s): the game still streams %ux%u.",
-                             test, xcloud_experiment_name(test), source_width, source_height);
-                else if (decode_width <= 1280 && decode_height <= 720)
+                diagnostic_flag("xcloud-720p", "the game stayed at %ux%u", source_width, source_height);
+                if (decode_width <= 1280 && decode_height <= 720)
                     snprintf(t->status, sizeof(t->status),
                              "This game only streams in 720p, which the 3DS can't show yet. Fortnite works.");
                 else
                     snprintf(t->status, sizeof(t->status),
-                             "This game streams at %ux%u, which the 3DS can't show. Fortnite works.",
+                             "This game streams at %ux%u, which is too big for the 3DS.",
                              source_width, source_height);
                 t->no_reconnect = true;
                 t->state = WEBRTC_FAILED;
@@ -578,8 +576,10 @@ static void on_video(const PeerVideoPacket *packet, void *userdata)
         if (t->decoder_failed_width == decode_width && t->decoder_failed_height == decode_height &&
             now - t->decoder_failed_at < 2000)
             return;
-        mvd_video_set_hd_mode(test == XCLOUD_TEST_720P_SHRINK ? MVD_HD_NAL_SHRINK :
-                              test == XCLOUD_TEST_720P_FULL ? MVD_HD_NAL : MVD_HD_GUARDED);
+        /* Build 142: a bigger work buffer (level 4.1) still crashed; the
+         * cause was P slices before a decoded IDR (mvd_video.c). */
+        mvd_video_set_hd_mode(decode_720p ? MVD_HD_NAL_HALF : MVD_HD_GUARDED);
+        mvd_video_set_big_work(false);
         if (!mvd_video_init(decode_width, decode_height)) {
             t->decoder_failed_width = decode_width;
             t->decoder_failed_height = decode_height;
@@ -610,14 +610,15 @@ static void on_video(const PeerVideoPacket *packet, void *userdata)
     if (t->steam) mvd_video_set_visible(source_width, source_height);
     if (!mvd_video_submit(packet->data, packet->size))
         snprintf(t->status, sizeof(t->status), "Video arrived; %.140s", mvd_video_status());
-    /* The 720p decode tests: say how they ended rather than stay black. */
-    if (decode_720p_test && !t->no_reconnect) {
+    /* Say how a 720p start failed rather than stay black. */
+    if (decode_720p && !t->no_reconnect) {
         const bool refused = mvd_video_failed();
         if (refused || (!mvd_video_decoded_frames() && osGetTime() - t->decoder_started_at > 10000)) {
-            diagnostic_flag("xcloud-720p", "test %d: %s (%s)", test, refused ? "decoder refused 720p" :
+            diagnostic_flag("xcloud-720p", "%s (%s)", refused ? "decoder refused 720p" :
                             "no 720p frame in 10 s", mvd_video_status());
-            snprintf(t->status, sizeof(t->status), "Test %d (%s): %s.", test, xcloud_experiment_name(test),
-                     refused ? "the 3DS refused 720p" : "no picture after 10 s");
+            snprintf(t->status, sizeof(t->status), "%s",
+                     refused ? "The 3DS couldn't decode this game's 720p picture." :
+                               "No picture from this game after 10 s.");
             t->no_reconnect = true;
             t->state = WEBRTC_FAILED;
         }
@@ -836,11 +837,13 @@ static void media_thread_start(WebRtcTransport *t)
     g_media_thread = threadCreate(media_main, t, 32 * 1024, priority - 1, 2, false);
     t->media_threaded = g_media_thread != NULL;
     if (!t->media_threaded) g_media_run = false;
+    http_set_gentle(true);
     diagnostic_log("WEBRTC", "media %s", t->media_threaded ? "on core 2" : "on the main core (core 2 unavailable)");
 }
 
 static void media_thread_stop(WebRtcTransport *t)
 {
+    http_set_gentle(false);
     if (!g_media_thread) return;
     g_media_run = false;
     threadJoin(g_media_thread, U64_MAX);
@@ -912,11 +915,7 @@ static bool start_xcloud(WebRtcTransport *t, NvstSignal *signal)
     t->answer_sent_at = osGetTime();
     diagnostic_log("WEBRTC", "xcloud answer applied (%lu bytes), %u remote candidates",
                    (unsigned long)signal->offer_size, signal->remote_ice_count);
-    if (xcloud_experiment())
-        snprintf(t->status, sizeof(t->status), "Connecting to the Xbox (test %d: %s)", xcloud_experiment(),
-                 xcloud_experiment_name(xcloud_experiment()));
-    else
-        snprintf(t->status, sizeof(t->status), "Connecting to the Xbox");
+    snprintf(t->status, sizeof(t->status), "Connecting to the Xbox");
     media_thread_start(t);
     return true;
 }
@@ -1112,9 +1111,12 @@ void *webrtc_transport_xcloud_offer(char **offer_out)
              "a=ice-options:trickle\r\na=fingerprint:sha-256 %s\r\na=setup:actpass\r\n", ufrag, pwd, fingerprint);
     /* Xbox ignores every request for a smaller picture (report XG8Z77: a
      * level 3.0 / max-fs offer still got 1280x720) but keeps to a bandwidth
-     * limit (b=, right after c=): 1 Mbps came in at ~850 kbps. */
-    const int test = xcloud_experiment();
-    const unsigned cap = test == XCLOUD_TEST_720P_SHRINK ? 1500 : test == XCLOUD_TEST_720P_FULL ? 1200 : 0;
+     * limit (b=, right after c=): 1 Mbps came in at ~850 kbps. Web player
+     * tests (2026-10-12): the 720p tier is the smallest (osName android or
+     * anything unknown; windows/tizen get 1080p), a 30 fps or max-mbps
+     * request is ignored, and 400 kbps held at ~460 kbps with 720p60 kept.
+     * Fewer bits per frame is all we can ask for: less for MVD to chew. */
+    const unsigned cap = xcloud_decode_720p() ? 1200 : 0;
     char video_ice[600];
     if (cap)
         snprintf(video_ice, sizeof(video_ice), "c=IN IP4 0.0.0.0\r\nb=AS:%u\r\nb=TIAS:%u\r\n%s", cap, cap * 1000,
@@ -1138,7 +1140,7 @@ void *webrtc_transport_xcloud_offer(char **offer_out)
         "m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n%sa=mid:2\r\na=sctp-port:5000\r\n"
         "a=max-message-size:262144\r\n",
         (unsigned long)(svcGetSystemTick() & 0x7fffffff), ice, video_ice, fmtp, ice);
-    if (test) diagnostic_log("WEBRTC", "xcloud offer test %d: cap=%u", test, cap);
+    if (cap) diagnostic_log("WEBRTC", "xcloud offer bandwidth cap=%u kbps", cap);
     /* The candidates libpeer gathered, for the ICE exchange. */
     for (const char *p = local; n > 0 && n < SDP_LIMIT && (p = strstr(p, "a=candidate:")) != NULL;) {
         const char *end = strstr(p, "\r\n");

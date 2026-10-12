@@ -32,6 +32,20 @@ static bool g_process_failed;
 /* 720p at full size (g_hd), decoded per g_hd_mode (mvd_video.h). */
 static bool g_hd;
 static int g_hd_mode;
+static bool g_big_work;
+/* 720p: whether MVD holds a decoded picture for P slices to refer to. Its
+ * first IDR comes back 0x17004 with nothing consumed; a P slice fed then
+ * makes the mvd module write through a null reference and the console
+ * crashes (dumps 40-43, every one at 0010f530; report FURPBY caught the
+ * call: IDR 207 bytes not taken, then a 35-byte P slice). Runs where the
+ * next unit happened to be another IDR played fine. */
+static bool g_hd_reference;
+static unsigned g_hd_p_held;
+/* Xbox 720p frames decoded, for keeping every second one. */
+static unsigned g_hd_decoded;
+/* 720p decoder calls logged and written to the card before they run (the
+ * mvd crashes take the console down with the log lines still in memory). */
+static unsigned g_hd_safe_logs;
 static bool g_first_sps_logged;
 static unsigned g_sps_level_rewrites;
 static unsigned g_hd_nal_logs;
@@ -104,6 +118,7 @@ static u16 *g_wide_outputs[WIDE_OUTPUTS];
 static int g_output_state[WIDE_OUTPUTS];
 static int g_ready_fifo[WIDE_OUTPUTS];
 static size_t g_output_bytes[WIDE_OUTPUTS];
+static u64 g_ready_tick[WIDE_OUTPUTS];
 static unsigned g_ready_count;
 static unsigned g_recycled_frames;
 static LightLock g_frame_lock;
@@ -112,6 +127,17 @@ static LightLock g_config_lock;
 static unsigned g_level_min = 255, g_level_max;
 
 static void decoder_main(void *arg);
+
+/* 720p: the line just logged goes to the card before the next mvd call
+ * (its crashes halt the console before the writer thread runs). */
+static void crash_checkpoint(void)
+{
+    /* Builds 141-145 wrote these to the card at once until the first IDR was
+     * in, to catch the 720p crash (P slices before a decoded IDR, fixed in
+     * 143). That made each start step 100-300 ms and filled the queue
+     * (reports FURPBY, SBXSGU): queued like the rest now. */
+    diagnostic_checkpoint();
+}
 
 static void record_performance(u64 process_ticks, u64 render_ticks, u64 copy_ticks)
 {
@@ -147,6 +173,8 @@ static void record_performance(u64 process_ticks, u64 render_ticks, u64 copy_tic
 bool mvd_video_init(unsigned input_width, unsigned input_height)
 {
     mvd_video_close();
+    /* Before the first checkpoint: setup steps go to the card first. */
+    g_hd_reference = false;
     g_frames = 0;
     g_errors = 0;
     g_picture_dark = false;
@@ -159,13 +187,16 @@ bool mvd_video_init(unsigned input_width, unsigned input_height)
      * to 800x480, though, so Xbox's 720p (Main, one reference) goes that way:
      * the NAL-by-NAL path never got past its first IDR (build 124). */
     const bool big = input_width > 960 || input_height > 544;
-    const bool shrink = g_hd_mode == MVD_HD_SHRINK || g_hd_mode == MVD_HD_NAL_SHRINK;
+    const bool shrink = g_hd_mode == MVD_HD_SHRINK || g_hd_mode == MVD_HD_NAL_SHRINK || g_hd_mode == MVD_HD_NAL_HALF;
     g_hd = big && g_hd_mode != MVD_HD_SHRINK;   /* 720p processing */
     const bool hd = big && !shrink;              /* full-size 720p output */
     g_wide = stream_profile_wide() && !hd;
     if (hd) {
         g_output_width = HD_OUTPUT_WIDTH;
         g_output_height = HD_OUTPUT_HEIGHT;
+    } else if (g_wide && big && g_hd_mode == MVD_HD_NAL_HALF) {
+        g_output_width = 640;
+        g_output_height = 352;
     } else if (g_wide) {
         g_output_width = WIDE_OUTPUT_WIDTH;
         g_output_height = WIDE_OUTPUT_HEIGHT;
@@ -198,6 +229,9 @@ bool mvd_video_init(unsigned input_width, unsigned input_height)
     g_first_sps_logged = false;
     g_sps_level_rewrites = 0;
     g_hd_nal_logs = 0;
+    g_hd_reference = false;
+    g_hd_p_held = 0;
+    g_hd_decoded = 0;
     g_status_ok = g_status_paramset = g_status_ready = g_status_incomplete = 0;
     g_perf_process_sum = g_perf_render_sum = g_perf_copy_sum = 0;
     g_perf_process_max = g_perf_render_max = g_perf_copy_max = 0;
@@ -215,19 +249,41 @@ bool mvd_video_init(unsigned input_width, unsigned input_height)
     calc.width = input_width;
     calc.height = input_height;
     u32 work_size = 0;
+    g_hd_safe_logs = 0;
     diagnostic_log("MVD", "preflight-enter %ux%u linearFreeKiB=%lu",
                    input_width, input_height,
                    (unsigned long)(linearSpaceFree() / 1024));
-    diagnostic_checkpoint();
+    crash_checkpoint();
     /* Fail rather than wait if mvd:STD is not there: a blocking lookup of a
      * service whose module is not running never returns, and it froze the
      * whole console (beta.5 CIA). The policy is restored after init. */
     srvSetBlockingPolicy(true);
     Result rc = mvdstdCalculateBufferSize(&calc, &work_size);
+    if (rc == 0 && big && g_big_work) {
+        /* Everything the wide pipeline allocates besides the work buffer. */
+        const u64 others = (u64)INPUT_CAPACITY + AU_RING_SIZE + 1024 * 1024 +
+                           (u64)WIDE_OUTPUTS * MVD_VIDEO_TEX_WIDTH * MVD_VIDEO_TEX_HEIGHT * sizeof(u16);
+        static const u8 levels[] = { MVD_H264_LEVEL_4_2, MVD_H264_LEVEL_4_1, MVD_H264_LEVEL_4_0 };
+        for (size_t i = 0; i < sizeof(levels); ++i) {
+            MVDSTD_CalculateWorkBufSizeConfig bigger = calc;
+            bigger.level.level = levels[i];
+            u32 size = 0;
+            const Result r = mvdstdCalculateBufferSize(&bigger, &size);
+            diagnostic_log("MVD", "720p work buffer at level %u: %lu bytes rc=%08lX", (unsigned)levels[i],
+                           (unsigned long)size, (unsigned long)r);
+            if (r == 0 && size > work_size && size + others <= linearSpaceFree()) {
+                calc = bigger;
+                work_size = size;
+                break;
+            }
+        }
+        diagnostic_log("MVD", "720p work buffer level %u, %lu bytes", (unsigned)calc.level.level,
+                       (unsigned long)work_size);
+    }
     diagnostic_log("MVD", "preflight %ux%u work=%lu sizeResult=%08lX linearFreeKiB=%lu",
                    input_width, input_height, (unsigned long)work_size,
                    (unsigned long)rc, (unsigned long)(linearSpaceFree() / 1024));
-    diagnostic_checkpoint();
+    crash_checkpoint();
     if (rc != 0) {
         srvSetBlockingPolicy(false);
         snprintf(g_status, sizeof(g_status), "MVD size failed %08lX", (unsigned long)rc);
@@ -241,19 +297,19 @@ bool mvd_video_init(unsigned input_width, unsigned input_height)
         snprintf(g_status, sizeof(g_status), "MVD 720p needs %lu KiB linear memory",
                  (unsigned long)((work_size + INPUT_CAPACITY + output_size + reserve_size) / 1024));
         diagnostic_log("MVD", "%s", g_status);
-        diagnostic_checkpoint();
+        crash_checkpoint();
         return false;
     }
     diagnostic_log("MVD", "init-enter %ux%u work=%lu", input_width, input_height,
                    (unsigned long)work_size);
-    diagnostic_checkpoint();
+    crash_checkpoint();
     rc = mvdstdInit(MVDMODE_VIDEOPROCESSING, MVD_INPUT_H264,
                     MVD_OUTPUT_BGR565, work_size, NULL);
     srvSetBlockingPolicy(false);
     if (rc != 0) {
         snprintf(g_status, sizeof(g_status), "MVD init failed %08lX", (unsigned long)rc);
         diagnostic_log("MVD", "%s", g_status);
-        diagnostic_checkpoint();
+        crash_checkpoint();
         /* libctru already closes the service handle and unwinds its refcount
          * when init fails. Calling Exit here makes later Init calls appear to
          * succeed without a handle (SetConfig then returns D8E007F7). */
@@ -261,7 +317,7 @@ bool mvd_video_init(unsigned input_width, unsigned input_height)
     }
     diagnostic_log("MVD", "init-return %ux%u rc=%08lX", input_width, input_height,
                    (unsigned long)rc);
-    diagnostic_checkpoint();
+    crash_checkpoint();
     g_active = true;
     g_input = linearMemAlign(INPUT_CAPACITY, 0x80);
     g_output = linearMemAlign(output_size, 0x80);
@@ -284,22 +340,22 @@ bool mvd_video_init(unsigned input_width, unsigned input_height)
     memset(g_output, 0, output_size);
     diagnostic_log("MVD", "config-generate-enter input=%ux%u output=%ux%u",
                    input_width, input_height, g_output_width, g_output_height);
-    diagnostic_checkpoint();
+    crash_checkpoint();
     mvdstdGenerateDefaultConfig(&g_config, input_width, input_height,
                                 g_output_width, g_output_height, NULL,
                                 (u32 *)g_output, NULL);
     diagnostic_log("MVD", "config-generate-return");
-    diagnostic_checkpoint();
+    crash_checkpoint();
     /* The override sets the buffer pitch: wide output lands in the top-left
      * 800x480 of a 1024x512 surface that can be tiled into a GPU texture. */
     g_config.flag_x104 = 1;
     g_config.output_width_override = g_output_stride;
     g_config.output_height_override = g_output_alloc_height;
     diagnostic_log("MVD", "set-config-enter");
-    diagnostic_checkpoint();
+    crash_checkpoint();
     rc = MVDSTD_SetConfig(&g_config);
     diagnostic_log("MVD", "set-config-return rc=%08lX", (unsigned long)rc);
-    diagnostic_checkpoint();
+    crash_checkpoint();
     if (rc != MVD_STATUS_OK && g_wide && g_output_height > 240) {
         /* An unusual stream size refused at full size: try half size, which
          * the GPU scales up (better a softer picture than none). */
@@ -615,6 +671,22 @@ size_t mvd_video_ready_frame_bytes(unsigned index)
     return bytes;
 }
 
+unsigned mvd_video_ready_frame_age_us(unsigned index)
+{
+    if (!g_wide) return 0;
+    LightLock_Lock(&g_frame_lock);
+    const u64 at = index < g_ready_count ? g_ready_tick[g_ready_fifo[index]] : 0;
+    LightLock_Unlock(&g_frame_lock);
+    return at ? (unsigned)((svcGetSystemTick() - at) / (SYSCLOCK_ARM11 / 1000000u)) : 0;
+}
+
+void mvd_video_hd_skip_one(void)
+{
+    LightLock_Lock(&g_frame_lock);
+    ++g_hd_decoded;
+    LightLock_Unlock(&g_frame_lock);
+}
+
 void mvd_video_skip_ready_frame(unsigned index)
 {
     if (!g_wide) return;
@@ -718,33 +790,62 @@ static Result process_720p_nals(const unsigned char *data, size_t size, bool *ha
         size_t nal_size = end - header;
         at = end;
         if (type != 1 && type != 5 && type != 7 && type != 8) continue;
+        if (type == 1 && !g_hd_reference) {
+            /* No picture to predict from yet: hold back, ask for an IDR. */
+            if (g_hd_p_held++ % 30 == 0) {
+                diagnostic_log("MVD", "720p P slice held back: no decoded IDR yet (%u so far)", g_hd_p_held);
+                g_resync_requested = true;
+            }
+            continue;
+        }
         if (nal_size + 3 > INPUT_CAPACITY) return (Result)-1;
         g_input[0] = 0; g_input[1] = 0; g_input[2] = 1;
         memcpy(g_input + 3, data + header, nal_size);
         if (type == 7) prepare_720p_sps(g_input, nal_size + 3);
         GSPGPU_FlushDataCache(g_input, nal_size + 3);
         bool trace = g_hd_nal_logs++ < 12;
-        if (trace) {
+        /* Keyframe slices are where mvd crashed: the first ones are logged
+         * and on the card before the call. */
+        const bool risky = type == 5 && nal_size > 8 * 1024 && g_hd_safe_logs < 12;
+        if (trace || risky) {
             diagnostic_log("MVD", "NAL enter type=%u bytes=%lu", type,
                            (unsigned long)(nal_size + 3));
-            diagnostic_checkpoint();
+            if (risky) ++g_hd_safe_logs;
+            crash_checkpoint();
         }
         MVDSTD_ProcessNALUnitOut result = {0};
         last = mvdstdProcessVideoFrame(g_input, nal_size + 3, 0, &result);
-        if (trace) {
+        if (trace || risky) {
             diagnostic_log("MVD", "NAL return type=%u rc=%08lX remaining=%lu",
                            type, (unsigned long)last, (unsigned long)result.remaining_size);
-            diagnostic_checkpoint();
+            crash_checkpoint();
         }
         if (!MVD_CHECKNALUPROC_SUCCESS(last)) return last;
+        if (type == 5 && last == MVD_STATUS_INCOMPLETEPROCESSING && result.remaining_size >= nal_size + 3) {
+            /* The IDR was answered without being taken: hand it over again
+             * (the next IDR always went in, reports 62AEG4 and FURPBY). */
+            MVDSTD_ProcessNALUnitOut again = {0};
+            last = mvdstdProcessVideoFrame(g_input, nal_size + 3, 0, &again);
+            diagnostic_log("MVD", "720p IDR not taken; resubmitted: rc=%08lX remaining=%lu", (unsigned long)last,
+                           (unsigned long)again.remaining_size);
+            crash_checkpoint();
+            if (!MVD_CHECKNALUPROC_SUCCESS(last)) return last;
+            result = again;
+        }
+        if (type == 5 && !g_hd_reference &&
+            (last == MVD_STATUS_FRAMEREADY || result.remaining_size < nal_size + 3)) {
+            g_hd_reference = true;
+            diagnostic_log("MVD", "720p IDR decoded: P slices go in from now on (%u held back)", g_hd_p_held);
+        }
         /* 800x480 answers its first IDR the same way and then decodes:
          * the NAL experiment carries on instead of stopping. */
         if ((type == 1 || type == 5) && g_hd_mode != MVD_HD_NAL && g_hd_mode != MVD_HD_NAL_SHRINK &&
+            g_hd_mode != MVD_HD_NAL_HALF &&
             last == MVD_STATUS_INCOMPLETEPROCESSING &&
             result.remaining_size >= nal_size + 3) {
             diagnostic_log("MVD", "720p slice not consumed type=%u bytes=%lu; stop before next service call",
                            type, (unsigned long)(nal_size + 3));
-            diagnostic_checkpoint();
+            crash_checkpoint();
             return MVD_HD_NO_PROGRESS;
         }
         if (type == 1 || type == 5) *has_vcl = true;
@@ -761,7 +862,7 @@ static bool decode_access_unit(const unsigned char *annex_b, unsigned char *inpu
     if (!g_first_process_done) {
         diagnostic_log("MVD", "first-process-enter bytes=%lu input=%ux%u",
                        (unsigned long)size, g_input_width, g_input_height);
-        diagnostic_checkpoint();
+        crash_checkpoint();
     }
     const u64 process_start = svcGetSystemTick();
     bool hd_has_vcl = false;
@@ -788,12 +889,12 @@ static bool decode_access_unit(const unsigned char *annex_b, unsigned char *inpu
             snprintf(g_status, sizeof(g_status), "MVD process %08lX AU %lu", (unsigned long)rc, (unsigned long)size);
         diagnostic_flag("decoder-fatal", "%s", g_status);
         diagnostic_log("MVD", "decoder submissions stopped after fatal process error");
-        diagnostic_checkpoint();
+        crash_checkpoint();
         return false;
     }
     if (!g_first_process_done) {
         diagnostic_log("MVD", "first-process-return rc=%08lX", (unsigned long)rc);
-        diagnostic_checkpoint();
+        crash_checkpoint();
         g_first_process_done = true;
     }
     if (rc == MVD_STATUS_OK) ++g_status_ok;
@@ -815,7 +916,7 @@ static bool decode_access_unit(const unsigned char *annex_b, unsigned char *inpu
     if (!g_first_render_done) {
         diagnostic_log("MVD", "first-render-enter input=%ux%u",
                        g_input_width, g_input_height);
-        diagnostic_checkpoint();
+        crash_checkpoint();
     }
     if (g_wide) {
         MVDSTD_Config config;
@@ -829,7 +930,7 @@ static bool decode_access_unit(const unsigned char *annex_b, unsigned char *inpu
     }
     if (!g_first_render_done) {
         diagnostic_log("MVD", "first-render-return rc=%08lX", (unsigned long)rc);
-        diagnostic_checkpoint();
+        crash_checkpoint();
         g_first_render_done = true;
     }
     const u64 render_ticks = svcGetSystemTick() - render_start;
@@ -859,13 +960,13 @@ static bool decode_access_unit(const unsigned char *annex_b, unsigned char *inpu
     const u64 copy_start = svcGetSystemTick();
     if (g_frames == 0) {
         diagnostic_log("MVD", "first-copy-enter");
-        diagnostic_checkpoint();
+        crash_checkpoint();
     }
     /* Wide frames are drawn by the GPU; the caller publishes them. */
     if (!g_wide) copy_to_top_framebuffer();
     if (g_frames == 0) {
         diagnostic_log("MVD", "first-copy-return");
-        diagnostic_checkpoint();
+        crash_checkpoint();
     }
     const u64 copy_ticks = svcGetSystemTick() - copy_start;
     record_performance(process_ticks, render_ticks, copy_ticks);
@@ -922,9 +1023,16 @@ static void decoder_main(void *arg)
         if (!g_process_failed)
             decode_access_unit(au, au, g_entry_size[slot], g_wide_outputs[target]);
         LightLock_Lock(&g_frame_lock);
-        if (g_frames != rendered_before) {
+        /* Xbox 720p is 60 fps (it ignores asking for 30) and is shown at 30.
+         * Showing the newest of whatever was ready (builds 146-148) stepped
+         * the game 1, 2 or 3 frames at a time with decode jitter: it judered
+         * and did not feel like 30 (build 148). Every second frame, kept
+         * here, is an even 30 fps the pacer treats like GeForce NOW's. */
+        const bool keep = !g_hd || (++g_hd_decoded & 1);
+        if (g_frames != rendered_before && keep) {
             g_output_state[target] = OUT_READY;
             g_output_bytes[target] = g_entry_size[slot];
+            g_ready_tick[target] = svcGetSystemTick();
             g_ready_fifo[g_ready_count++] = target;
         } else {
             g_output_state[target] = OUT_FREE;
@@ -1071,7 +1179,9 @@ void mvd_video_close(void)
 
 bool mvd_video_active(void) { return g_active; }
 void mvd_video_set_hd_mode(int mode) { g_hd_mode = mode; }
+void mvd_video_set_big_work(bool big) { g_big_work = big; }
 bool mvd_video_failed(void) { return g_active && g_process_failed; }
+bool mvd_video_hd(void) { return g_active && g_hd; }
 unsigned mvd_video_decoded_frames(void) { return g_frames; }
 unsigned mvd_video_pending_units(void) { return g_queue_count; }
 unsigned mvd_video_frames_lost(void) { return g_frames_lost; }

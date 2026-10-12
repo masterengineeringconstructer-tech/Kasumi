@@ -1955,9 +1955,11 @@ static void draw_library_top(const App *app, bool entering)
         unsigned library_games = 0;
         const bool missing = searching && gfn_library_known(&library_games) && library_games && !gfn_in_library(focused);
         char line[160];
-        snprintf(line, sizeof(line), "%s  ·  %s", missing ? "NOT IN LIBRARY" : store_label(focused->store),
-                 stream_line(app));
-        ui_text_fit(200, 200, 11, missing ? UI_KIN : UI_TEXT_DIM, UI_ALIGN_CENTER, 370, line);
+        /* Paid-only on a free account: NVIDIA refuses it after the queue. */
+        const bool paid = app_service(app) == SERVICE_GFN && focused->needs_paid;
+        snprintf(line, sizeof(line), "%s  ·  %s", missing ? "NOT IN LIBRARY" : paid ? "PAID MEMBERSHIP ONLY"
+                 : store_label(focused->store), stream_line(app));
+        ui_text_fit(200, 200, 11, missing || paid ? UI_KIN : UI_TEXT_DIM, UI_ALIGN_CENTER, 370, line);
     }
     /* L and R sit beside the tabs, so the row stays short enough for 15 px. */
     static const char *const hints[] = { "◀ ▶", "Browse", "A", "Open", "X", "Search", "B", "Home", NULL };
@@ -4209,6 +4211,12 @@ static void draw_modal_bottom(const App *app, float p)
         providers_partner_here(&partner, NULL);
         ui_button(MODAL_LEFT, partner.name, "推奨", UI_BUTTON_PRIMARY, pressed(app, MODAL_LEFT));
         ui_button(MODAL_RIGHT, "NVIDIA", "エヌビディア", UI_BUTTON_NORMAL, pressed(app, MODAL_RIGHT));
+        ui_offset(0.0f, 0.0f);
+        return;
+    }
+    if (app->modal == MODAL_PAID_ONLY) {
+        ui_button(MODAL_LEFT, "PLAY ANYWAY", "開始", UI_BUTTON_PRIMARY, pressed(app, MODAL_LEFT));
+        ui_button(MODAL_RIGHT, "BACK", "戻る", UI_BUTTON_NORMAL, pressed(app, MODAL_RIGHT));
         ui_offset(0.0f, 0.0f);
         return;
     }

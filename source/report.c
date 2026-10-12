@@ -184,15 +184,41 @@ static char *scrub(const char *in, size_t length)
     return out;
 }
 
+/* A log cut short by a crash can end in garbage (or zeros) where the card
+ * never got the last write. One invalid byte made jansson refuse the whole
+ * string, and the report went out without the log that mattered (report
+ * YU293Z, after an mvd crash). Keep valid UTF-8, replace the rest with '?'. */
+static void valid_text(char *text, size_t length)
+{
+    for (size_t i = 0; i < length;) {
+        const unsigned char c = (unsigned char)text[i];
+        size_t need = c < 0x80 ? 0 : (c & 0xE0) == 0xC0 ? 1 : (c & 0xF0) == 0xE0 ? 2 : (c & 0xF8) == 0xF0 ? 3 : 4;
+        bool ok = need < 4 && (c >= 0x20 || c == '\n' || c == '\r' || c == '\t') && i + need < length;
+        for (size_t k = 1; ok && k <= need; ++k) ok = ((unsigned char)text[i + k] & 0xC0) == 0x80;
+        if (!ok) {
+            text[i++] = '?';
+            continue;
+        }
+        i += need + 1;
+    }
+}
+
 static json_t *scrubbed_file(const char *path, size_t cap)
 {
     if (!cap) return json_string("");
     size_t length = 0;
     char *raw = read_file(path, cap, &length);
     if (!raw) return json_string("");
+    valid_text(raw, length);
     char *clean = scrub(raw, length);
     free(raw);
     json_t *value = json_stringn(clean ? clean : "", clean ? strlen(clean) : 0);
+    if (!value && clean) {
+        /* Still refused (an overlong or surrogate sequence): ASCII only. */
+        for (char *p = clean; *p; ++p)
+            if ((unsigned char)*p >= 0x80) *p = '?';
+        value = json_string(clean);
+    }
     free(clean);
     return value ? value : json_string("");
 }
@@ -227,7 +253,10 @@ static bool dump_is_kasumi(const unsigned char *data, size_t length)
     if ((size_t)header[9] < 16 || extra + 16 > length) return false;
     uint64_t title = 0;
     memcpy(&title, data + extra + 8, sizeof(title));
-    return !memcmp(data + extra, APP_NAME, strlen(APP_NAME)) || title == KASUMI_TITLE_ID;
+    /* The video decoder service crashes on what Kasumi feeds it (dumps 40
+     * and 41: mvd, data abort at 0010f530); those belong in the report. */
+    return !memcmp(data + extra, APP_NAME, strlen(APP_NAME)) || title == KASUMI_TITLE_ID ||
+           !memcmp(data + extra, "mvd", 4);
 }
 
 /* The newest Luma ARM11 crash dump of Kasumi from the last few days. */

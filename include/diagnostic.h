@@ -14,6 +14,10 @@
 void diagnostic_init(void);
 void diagnostic_close(void);
 void diagnostic_checkpoint(void);
+/* Write the lines so far to the card now, on this thread: before a call
+ * that may take the whole console down (the mvd module's crashes), where
+ * the writer thread would not get to run. Slow on a slow card. */
+void diagnostic_checkpoint_now(void);
 void diagnostic_log(const char *component, const char *format, ...);
 void diagnostic_vlog(const char *component, const char *format, va_list args);
 

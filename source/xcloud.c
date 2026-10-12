@@ -642,60 +642,25 @@ bool xcloud_search(GfnClient *c, const char *query)
 
 /* ---- Sessions ------------------------------------------------------------------- */
 
-/* ---- Resolution experiments ---------------------------------------------------- */
+/* ---- 720p ---------------------------------------------------------------------- */
 
-static int g_experiment;
+/* Tests on Asphalt 9 (report SBXSGU): MVD shrinking 720p to exactly half
+ * (640x352) costs 14.7 ms a frame, under the 16.7 that 60 fps leaves;
+ * 800x480 cost 21.7 ms, fell behind and froze every ~4 s. Full size on the
+ * media thread (build 144) decoded in 14 ms but starved the socket. */
+static bool g_decode_720p;
 
-int xcloud_experiment(void) { return g_experiment; }
+bool xcloud_decode_720p(void) { return g_decode_720p; }
 
-const char *xcloud_experiment_name(int experiment)
-{
-    switch (experiment) {
-    case XCLOUD_TEST_720P_SHRINK: return "720p shrunk to 800x480, 1.5 Mbps (new)";
-    case XCLOUD_TEST_720P_FULL: return "720p full size, 1.2 Mbps";
-    default: return "none";
-    }
-}
-
-/* The next experiment, kept on the SD card so a crash moves on to the next. */
-static int next_experiment(void)
-{
-    const char *path = APP_DATA_DIR "/xbox-test.txt";
-    int last = 0;
-    FILE *f = fopen(path, "r");
-    if (f) {
-        if (fscanf(f, "%d", &last) != 1) last = 0;
-        fclose(f);
-    }
-    int next = last + 1;
-    if (next <= XCLOUD_TEST_NONE || next >= XCLOUD_TEST_COUNT) next = XCLOUD_TEST_NONE + 1;
-    f = fopen(path, "w");
-    if (f) {
-        fprintf(f, "%d\n", next);
-        fclose(f);
-    }
-    return next;
-}
-
-bool xcloud_available(void)
-{
-    static int known = -1;
-    if (known < 0) {
-        FILE *f = fopen(APP_DATA_DIR "/xbox-test.txt", "r");
-        known = f != NULL;
-        if (f) fclose(f);
-    }
-    return known == 1;
-}
+/* Paused for maintenance in 1.0.4-1.0.5 (720p crashed the console), back
+ * since build 150: false here pauses it again (the hub says so). */
+bool xcloud_available(void) { return true; }
 
 bool xcloud_start_session(GfnClient *c, const GfnGame *game)
 {
-    /* Fortnite already streams 800x480: keep it plain. Tests only run on
-     * a tester's console (xcloud_available). */
-    g_experiment = xcloud_available() && strcmp(game->app_id, "FORTNITE") ? next_experiment()
-                                                                            : XCLOUD_TEST_NONE;
-    if (g_experiment)
-        diagnostic_log("XCLOUD", "resolution test %d: %s", g_experiment, xcloud_experiment_name(g_experiment));
+    /* Fortnite switches to 800x480 a few seconds in: keep it plain. */
+    g_decode_720p = strcmp(game->app_id, "FORTNITE") != 0;
+    diagnostic_log("XCLOUD", "720p at half size: %s", g_decode_720p ? "yes" : "no (Fortnite)");
     c->session_state = GFN_SESSION_IDLE;
     c->fail_code[0] = c->end_error_code[0] = '\0';
     c->queue_position = 0;

@@ -45,7 +45,9 @@ typedef enum {
     /* Delete the screenshot on screen? */
     MODAL_DELETE_SHOT,
     /* Leaving a Steam Link stream: just disconnect, or quit the game on the PC. */
-    MODAL_STEAM_LEAVE
+    MODAL_STEAM_LEAVE,
+    /* A game for paid GeForce NOW memberships, on a free account. */
+    MODAL_PAID_ONLY
 } AppModal;
 
 typedef enum {

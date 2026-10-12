@@ -135,6 +135,12 @@ void diagnostic_checkpoint(void)
     else write_pending();
 }
 
+void diagnostic_checkpoint_now(void)
+{
+    write_pending();
+    write_pending();
+}
+
 void diagnostic_vlog(const char *component, const char *format, va_list args)
 {
     char line[DIAGNOSTIC_LINE];

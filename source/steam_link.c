@@ -434,9 +434,8 @@ bool steam_link_begin_login(GfnClient *c, const char *choice)
         return login_failed(c, why);
     }
     if (typed && update_paired_address(c, &hosts[0])) return false;
-    /* 5 s: a PC on Wi-Fi power saving can be slow to hear a broadcast.
-     * Then the address typed before, where broadcasts don't get through. */
-    if (!found) found = steam_discover(&g.id, 0, hosts, 4, 5000);
+    /* Everyone on this Wi-Fi, then the address typed before (broadcasts may not get through). */
+    if (!found) found = steam_discover(&g.id, 0, hosts, 4, 2000);
     if (!found && g.typed_ip) found = steam_discover(&g.id, g.typed_ip, hosts, 1, 1500);
     if (!found && g.paired) return login_failed(c, "No other PC with Steam found. Press X to type its address.");
     if (!found)
@@ -681,7 +680,7 @@ static bool find_host(SteamHost *host)
     /* The typed address (the PC's may have changed since), then everyone. */
     int found = 0;
     if (g.typed_ip && g.typed_ip != g.host.ip) found = steam_discover(&g.id, g.typed_ip, hosts, 1, 1200);
-    if (!found || hosts[0].client_id != g.host.client_id) found = steam_discover(&g.id, 0, hosts, 8, 5000);
+    if (!found || hosts[0].client_id != g.host.client_id) found = steam_discover(&g.id, 0, hosts, 8, 2000);
     for (int i = 0; i < found; ++i) {
         if (hosts[i].client_id != g.host.client_id) continue;
         *host = hosts[i];

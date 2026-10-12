@@ -191,6 +191,11 @@ static void render_wide_video(bool draw_bottom)
      * whose encoded size says little moved, and drops that one instead. */
     static unsigned drop_wait, quiet_drops;
     static float avg_bytes;
+    /* How long shown frames waited after decoding: input lag of our own. */
+    static u64 wait_sum_us;
+    static unsigned wait_max_us, hd_shifts;
+    static float hd_wait_ms;
+    static u64 last_hd_shift;
     bool present = false;
     /* citro3d counts top-screen vblanks in its own GSP handler (only one
      * handler per event is allowed, so we must not register another). */
@@ -218,20 +223,28 @@ static void render_wide_video(bool draw_bottom)
         if (!rate_since || decoded_now < rate_frames) {
             /* Until measured, trust the rate asked for (the first 2 s of a
              * 60 fps stream paced as 30 skipped 62 frames). */
-            sixty = stream_profile_fps() >= 60;
+            sixty = stream_profile_fps() >= 60 && !mvd_video_hd();
             rate_since = now_ms;
             rate_frames = decoded_now;
         } else if (now_ms - rate_since >= 2000) {
             const unsigned fps = (unsigned)((decoded_now - rate_frames) * 1000ull / (now_ms - rate_since));
             const bool was = sixty;
-            sixty = stream_profile_fps() >= 60 && fps >= 45;
+            /* Xbox's 720p stays at a steady 30. Shrunk to 800x480 it decoded
+             * at ~45 a second and the cadence flipped 30/60 every 2 s (reports
+             * 62AEG4, FURPBY). At half size it decodes 60 in 14.5 ms while
+             * shown at 30, but showing all 60 slowed MVD to ~18 ms a frame:
+             * it fell behind and dropped to a keyframe every 6 s (build 147,
+             * report 7XXNYS). */
+            sixty = stream_profile_fps() >= 60 && fps >= 45 && !mvd_video_hd();
             if (sixty != was) diagnostic_log("VIDEO", "pacing %s (%u fps arriving)", sixty ? "60" : "30", fps);
             rate_since = now_ms;
             rate_frames = decoded_now;
         }
         /* Decoded frames waiting to be shown are input lag: at 60 fps keep
          * one beyond the reserve (~33-50 ms in all), not three (report
-         * EM7YGV felt the 30 fps cap as lag at 60). */
+         * EM7YGV felt the 30 fps cap as lag at 60). Xbox 720p comes in at
+         * 60 but mvd_video keeps every second frame, so it is paced like
+         * any 30 fps stream. */
         while (ready > reserve + (sixty ? 1u : 3u)) {
             mvd_video_skip_oldest_frame();
             --ready;
@@ -256,7 +269,31 @@ static void render_wide_video(bool draw_bottom)
          * that has sat for a whole second is dropped (build 62 dropped the
          * reserve itself every ~4 s and was choppy). */
         if (present) {
+            const unsigned age = mvd_video_ready_frame_age_us(0);
+            wait_sum_us += age;
+            if (age > wait_max_us) wait_max_us = age;
             depth_sum += ready;
+        }
+        /* Xbox's 60 fps against the LCD's 59.83 Hz: the 30 kept frames come
+         * a little faster than they are shown, so each waits longer than the
+         * last until a whole spare frame (+33 ms) builds up, which the drain
+         * below lets sit for up to 5 s. Instead, once frames wait more than
+         * ~28 ms on average, the next 60 fps frame is kept rather than the
+         * one after: 17 ms less wait, one 50 ms step in the game instead of
+         * 33. Kept clear of repeats, which a wait near 0 would bring. */
+        const bool xbox_hd = !sixty && mvd_video_hd();
+        if (present && xbox_hd) {
+            const float age_ms = (float)mvd_video_ready_frame_age_us(0) / 1000.0f;
+            hd_wait_ms = hd_wait_ms > 0.0f ? hd_wait_ms * 0.9f + age_ms * 0.1f : age_ms;
+            if ((hd_wait_ms > 28.0f || ready >= 2) && now_ms - last_hd_shift >= 500 &&
+                now_ms - last_repeat_at >= 2000) {
+                mvd_video_hd_skip_one();
+                hd_wait_ms -= 16.7f;
+                last_hd_shift = now_ms;
+                ++hd_shifts;
+            }
+        }
+        if (present && !xbox_hd) {
             const float bytes = (float)mvd_video_ready_frame_bytes(0);
             avg_bytes = avg_bytes > 0.0f ? avg_bytes * 0.95f + bytes * 0.05f : bytes;
             backlog_streak = ready >= reserve + 2 ? backlog_streak + 1 : 0;
@@ -344,12 +381,15 @@ static void render_wide_video(bool draw_bottom)
     if (pending_frames >= 600 || (pending_frames >= 120 && (repeated > 6 || skipped > 3))) {
         const u64 per_us = SYSCLOCK_ARM11 / 1000000u;
         const unsigned frames = presented - last_log_frames;
-        diagnostic_log("VIDEO", "paced present frames=%u avg/max=%llu/%llu us repeated=%u skipped=%u drained=%u quiet=%u depth=%u.%02u reserve=%u loopMax=%u slow=%u",
+        diagnostic_log("VIDEO", "paced present frames=%u avg/max=%llu/%llu us repeated=%u skipped=%u drained=%u quiet=%u depth=%u.%02u reserve=%u loopMax=%u slow=%u wait=%llu/%u ms shifts=%u",
                        frames,
                        (unsigned long long)(present_ticks / frames / per_us),
                        (unsigned long long)(present_max / per_us), repeated, skipped, drained,
                        quiet_drops, depth_sum / frames, depth_sum * 100 / frames % 100, reserve,
-                       g_loop_max_ms, g_loop_slow);
+                       g_loop_max_ms, g_loop_slow, (unsigned long long)(wait_sum_us / frames / 1000u),
+                       wait_max_us / 1000u, hd_shifts);
+        wait_sum_us = 0;
+        wait_max_us = hd_shifts = 0;
         g_loop_max_ms = g_loop_slow = 0;
         present_ticks = present_max = 0;
         repeated = skipped = drained = quiet_drops = depth_sum = 0;
@@ -644,8 +684,23 @@ static const char *launch_share_id(void)
     return g_app.settings.share_stats ? g_app.settings.install_id : NULL;
 }
 
+/* Set by Play anyway: the next launch skips the paid-membership warning. */
+static bool g_paid_confirmed;
+
 static void launch_game(const GfnGame *game)
 {
+    /* NVIDIA refuses paid-only games on the free tier, and only after the
+     * queue: say so first. */
+    if (current_service() == SERVICE_GFN && game->needs_paid && !g_paid_confirmed) {
+        if (game != &g_current_game) g_current_game = *game;
+        char text[sizeof(g_app.modal_text)];
+        snprintf(text, sizeof(text), "%.50s needs a Performance or Ultimate membership. NVIDIA says this "
+                 "account can't play it, so it will likely be refused.", game->title);
+        open_modal(MODAL_PAID_ONLY, "有料", "NEEDS A PAID MEMBERSHIP", text);
+        diagnostic_log("APP", "paid-only game on this account: %s", game->title);
+        return;
+    }
+    g_paid_confirmed = false;
     static u64 last_launch;
     const u64 now = osGetTime();
     /* Only NVIDIA refuses launches that come too fast. */
@@ -1423,6 +1478,12 @@ static void handle_modal(u32 down, AppAction action)
     if (dismiss) return;
     if (modal == MODAL_SEND_REPORT) {
         submit_job(NET_JOB_SEND_REPORT, "Sending diagnostic report...", NULL, NULL);
+        return;
+    }
+    if (modal == MODAL_PAID_ONLY) {
+        g_paid_confirmed = true;
+        diagnostic_log("APP", "playing the paid-only game anyway");
+        launch_game(&g_current_game);
         return;
     }
     if (modal == MODAL_SHORTCUT_REMOVE) {
@@ -3588,7 +3649,9 @@ static void fps60_latency_guard(u64 now)
     static u64 backed_up_since, last_catchup, window_at;
     static unsigned window_catchups;
     static u64 hinted_for;
-    if (stream_profile_fps() < 60 || g_app.view != VIEW_STREAM || !g_app.stream_started_at ||
+    /* Xbox 720p always arrives at 60, whatever the setting says. */
+    const bool xbox_hd = mvd_video_hd();
+    if ((stream_profile_fps() < 60 && !xbox_hd) || g_app.view != VIEW_STREAM || !g_app.stream_started_at ||
         g_transport.state != WEBRTC_CONNECTED || now < g_app.stream_started_at + 3000) {
         backed_up_since = 0;
         return;
@@ -3616,7 +3679,7 @@ static void fps60_latency_guard(u64 now)
         window_at = now;
         window_catchups = 0;
     }
-    if (++window_catchups >= 4 && hinted_for != g_app.stream_started_at) {
+    if (++window_catchups >= 4 && hinted_for != g_app.stream_started_at && !xbox_hd) {
         hinted_for = g_app.stream_started_at;
         show_notice("Heavy game for 60 fps on the 3DS: 30 fps will feel smoother (Settings > Picture)");
     }

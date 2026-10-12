@@ -42,6 +42,10 @@ typedef struct {
     } variants[GFN_MAX_VARIANTS];
     unsigned variant_count;
     unsigned variant_selected;
+    /* NVIDIA lists it for paid memberships only ("Premium"), and this
+     * account can't play it (free tier): launching it is refused. */
+    bool premium;
+    bool needs_paid;
 } GfnGame;
 
 /* A session in the way of a launch (SESSION_LIMIT_PER_DEVICE_EXCEEDED): the

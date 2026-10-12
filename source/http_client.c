@@ -1,5 +1,6 @@
 #include "http_client.h"
 
+#include <3ds.h>
 #include <curl/curl.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -23,6 +24,38 @@ static HttpProgress g_next_progress;
 static void *g_next_context;
 
 void http_cancel(void) { g_cancel = true; }
+
+/* All sockets share one IPC session with the soc service, so a call that
+ * waits blocks every other thread's socket calls behind it. curl waiting in
+ * poll() for a server's answer held the stream's socket reads for ~140 ms:
+ * Xbox's keepalive every 30 s was a 150 ms video gap and a main-loop stall
+ * each time (report 7XXNYS). During a stream the worker's requests are run
+ * step by step instead, never waiting inside a socket call, and reuse the
+ * DNS answers and connections of the requests made before the stream. */
+static volatile bool g_gentle;
+static CURLM *g_gentle_multi;
+static CURLSH *g_share;
+
+void http_set_gentle(bool on) { g_gentle = on; }
+
+static CURLcode gentle_perform(CURL *curl)
+{
+    if (!g_gentle_multi) g_gentle_multi = curl_multi_init();
+    if (!g_gentle_multi || curl_multi_add_handle(g_gentle_multi, curl) != CURLM_OK)
+        return curl_easy_perform(curl);
+    CURLcode result = CURLE_RECV_ERROR;
+    int running = 1;
+    while (running) {
+        if (curl_multi_perform(g_gentle_multi, &running) != CURLM_OK) break;
+        if (running) svcSleepThread(2000000LL);
+    }
+    CURLMsg *message;
+    int left;
+    while ((message = curl_multi_info_read(g_gentle_multi, &left)) != NULL)
+        if (message->msg == CURLMSG_DONE && message->easy_handle == curl) result = message->data.result;
+    curl_multi_remove_handle(g_gentle_multi, curl);
+    return result;
+}
 
 void http_next_request(long timeout_seconds, HttpProgress progress, void *context)
 {
@@ -174,6 +207,20 @@ static bool perform(CURL **handle, volatile bool *cancel, long timeout, HttpProg
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout > 0 ? timeout : 25L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_MAXCONNECTS, 2L);
+    /* The worker's handle only (one thread, so no share locks needed). */
+    if (handle == &g_http) {
+        if (!g_share) {
+            g_share = curl_share_init();
+            if (g_share) {
+                curl_share_setopt(g_share, CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS);
+                curl_share_setopt(g_share, CURLSHOPT_SHARE, CURL_LOCK_DATA_CONNECT);
+                curl_share_setopt(g_share, CURLSHOPT_SHARE, CURL_LOCK_DATA_SSL_SESSION);
+            }
+        }
+        if (g_share) curl_easy_setopt(curl, CURLOPT_SHARE, g_share);
+        /* A lookup blocks too: keep answers for the length of a session. */
+        curl_easy_setopt(curl, CURLOPT_DNS_CACHE_TIMEOUT, 600L);
+    }
     curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, (long)CURL_HTTP_VERSION_1_1);
     curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
@@ -199,7 +246,7 @@ static bool perform(CURL **handle, volatile bool *cancel, long timeout, HttpProg
         }
     }
 
-    const CURLcode result = curl_easy_perform(curl);
+    const CURLcode result = g_gentle && handle == &g_http ? gentle_perform(curl) : curl_easy_perform(curl);
     response->curl_code = (int)result;
     {
         curl_off_t value = 0;

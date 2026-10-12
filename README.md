@@ -61,8 +61,9 @@ to four PCs can be paired (press Y in the Steam library), and *Quit game*
 closes the game on the PC when you leave.
 
 **Xbox Cloud Gaming** *(beta)*. Sign in with your Microsoft account from your
-phone and play Game Pass and free-to-play games at 60 fps, with your place in
-the queue and an estimated wait.
+phone and play Game Pass and free-to-play games, with your place in the queue
+and an estimated wait. Xbox streams every game but Fortnite in 720p; the 3DS
+decodes it at half size and shows a steady 30 fps.
 
 <table>
   <tr>
@@ -267,7 +268,8 @@ Some routers, guest networks and PC firewalls block the search. Press **X** on
 the Steam Link card (or Y, then X, once paired) and type your PC's IPv4
 address: run `ipconfig` on the PC and look for a number like 192.168.1.20. If
 nothing answers there either, set the PC's network to *Private* in Windows'
-network settings, or allow Steam through Windows Firewall.
+network settings, or allow Steam through Windows Firewall. On Linux, open UDP
+ports 27031-27036 and TCP ports 27036-27037 in the firewall (ufw, firewalld).
 
 **Do I need a paid GeForce NOW membership?**
 No. The free tier works, with a queue before each session and a one-hour
@@ -281,7 +283,7 @@ models have.
 **30 or 60 FPS, and which bitrate?**
 GeForce NOW and Steam Link stream at 30 FPS by default; *Settings > Picture >
 Frame rate* offers 60 FPS (beta), which wants strong Wi-Fi. Xbox Cloud Gaming
-streams at 60. For GeForce NOW, Kasumi uses about 1.3 Mbps by default
+shows a steady 30 FPS of Xbox's 60. For GeForce NOW, Kasumi uses about 1.3 Mbps by default
 (*Adaptive*), about 1.8-2 Mbps with *Sharp* on strong Wi-Fi, and about 1 Mbps
 with *Steady 1 Mbps* for weak Wi-Fi or a phone hotspot.
 
