@@ -8,7 +8,9 @@
 
 /* Build 69 capped the library at 64; accounts with Steam sync can own
  * hundreds of games (the diagnostic that reported this had 219). */
-#define GFN_MAX_GAMES 256
+/* Game Pass alone has a few hundred cloud games; 256 cut Xbox libraries
+ * short, and Xbox search only looks at what was loaded (1.0.6). */
+#define GFN_MAX_GAMES 1024
 #define GFN_MAX_VARIANTS 4
 
 typedef enum {
@@ -78,6 +80,7 @@ typedef struct {
     char client_token[4096];
     int64_t client_token_expires_at;
     char user_id[256];
+    /* game_count must follow games: net_worker copies only the filled part. */
     GfnGame games[GFN_MAX_GAMES];
     size_t game_count;
     /* When the owned library shown was fetched (0 = never / not cached). */

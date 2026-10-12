@@ -3,6 +3,7 @@
 #include "queue_eta.h"
 
 #include <3ds.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -38,10 +39,25 @@ static volatile bool g_signal_starting;
 static volatile bool g_cancelled;
 static NetJobResult g_result;
 
+/* The game list is most of the client (1024 slots, ~700 KiB) and it is
+ * copied every 200 ms: only the filled part of it is. */
+_Static_assert(offsetof(GfnClient, game_count) ==
+               offsetof(GfnClient, games) + sizeof(((GfnClient *)0)->games),
+               "game_count must follow games");
+
+static void copy_client(GfnClient *to, const GfnClient *from)
+{
+    const size_t head = offsetof(GfnClient, games);
+    const size_t tail = offsetof(GfnClient, game_count);
+    memcpy(to, from, head);
+    memcpy(to->games, from->games, from->game_count * sizeof(GfnGame));
+    memcpy((char *)to + tail, (const char *)from + tail, sizeof(GfnClient) - tail);
+}
+
 static void publish(void)
 {
     LightLock_Lock(&g_lock);
-    memcpy(&g_shared, &g_work, sizeof(g_shared));
+    copy_client(&g_shared, &g_work);
     ++g_version;
     LightLock_Unlock(&g_lock);
 }
@@ -255,7 +271,7 @@ bool net_worker_sync(GfnClient *out)
     LightLock_Lock(&g_lock);
     const bool changed = g_version != seen;
     if (changed) {
-        memcpy(out, &g_shared, sizeof(*out));
+        copy_client(out, &g_shared);
         seen = g_version;
     }
     LightLock_Unlock(&g_lock);

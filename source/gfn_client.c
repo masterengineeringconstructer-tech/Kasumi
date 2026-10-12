@@ -720,7 +720,7 @@ static bool fetch_catalog(GfnClient *client, const char *search_query, bool owne
      * can't play. A free game marked unplayable means NVIDIA answered
      * without the account (every game reads unplayable then). */
     unsigned premium = 0, needs_paid = 0, playable = 0, unpersonal = 0;
-    for (int page = 0; page < 8 && client->game_count < GFN_MAX_GAMES; ++page) {
+    for (int page = 0; page < 16 && client->game_count < GFN_MAX_GAMES; ++page) {
     json_t *body_root = json_object();
     json_t *variables = json_object();
     json_t *filters = owned_only
