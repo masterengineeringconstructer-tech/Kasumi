@@ -144,6 +144,7 @@ SystemControlInfo:
   SaveDataSize            : 0KB
   RemasterVersion          : 1
   StackSize                : 0x40000
+  SystemMode: 3
 
   Dependency:
     ac: 0x0004013000002402
