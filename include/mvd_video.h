@@ -50,6 +50,8 @@ unsigned mvd_video_ready_frame_age_us(unsigned index);
 /* Xbox 720p: keep the next 60 fps frame instead of the one after (the 30
  * shown move 17 ms later, so they wait 17 ms less to be shown). */
 void mvd_video_hd_skip_one(void);
+/* Xbox 720p at 60 being shown as every second frame (false for a 30 fps game). */
+bool mvd_video_hd_halving(void);
 /* Discard one decoded frame anywhere in the ready queue. */
 void mvd_video_skip_ready_frame(unsigned index);
 /* Skip decoding until the next IDR (a frame was lost upstream). */

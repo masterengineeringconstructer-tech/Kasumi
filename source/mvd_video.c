@@ -41,8 +41,13 @@ static bool g_big_work;
  * next unit happened to be another IDR played fine. */
 static bool g_hd_reference;
 static unsigned g_hd_p_held;
-/* Xbox 720p frames decoded, for keeping every second one. */
+/* Xbox 720p frames decoded, for keeping every second one, and how fast
+ * they come: heavy games stream at 30 (issue #12, report Z6FGRG: Forza
+ * Horizon 6 and AC Mirage), where halving showed 15 fps. */
 static unsigned g_hd_decoded;
+static u64 g_hd_last_tick;
+static float g_hd_interval_ms;
+static bool g_hd_halve;
 /* 720p decoder calls logged and written to the card before they run (the
  * mvd crashes take the console down with the log lines still in memory). */
 static unsigned g_hd_safe_logs;
@@ -232,6 +237,9 @@ bool mvd_video_init(unsigned input_width, unsigned input_height)
     g_hd_reference = false;
     g_hd_p_held = 0;
     g_hd_decoded = 0;
+    g_hd_last_tick = 0;
+    g_hd_interval_ms = 0.0f;
+    g_hd_halve = true;
     g_status_ok = g_status_paramset = g_status_ready = g_status_incomplete = 0;
     g_perf_process_sum = g_perf_render_sum = g_perf_copy_sum = 0;
     g_perf_process_max = g_perf_render_max = g_perf_copy_max = 0;
@@ -680,6 +688,8 @@ unsigned mvd_video_ready_frame_age_us(unsigned index)
     return at ? (unsigned)((svcGetSystemTick() - at) / (SYSCLOCK_ARM11 / 1000000u)) : 0;
 }
 
+bool mvd_video_hd_halving(void) { return g_active && g_hd && g_hd_halve; }
+
 void mvd_video_hd_skip_one(void)
 {
     LightLock_Lock(&g_frame_lock);
@@ -1027,8 +1037,28 @@ static void decoder_main(void *arg)
          * Showing the newest of whatever was ready (builds 146-148) stepped
          * the game 1, 2 or 3 frames at a time with decode jitter: it judered
          * and did not feel like 30 (build 148). Every second frame, kept
-         * here, is an even 30 fps the pacer treats like GeForce NOW's. */
-        const bool keep = !g_hd || (++g_hd_decoded & 1);
+         * here, is an even 30 fps the pacer treats like GeForce NOW's. A
+         * game that streams 30 keeps every frame: about 17 ms apart halves,
+         * 33 ms apart keeps all, with a gap between so it doesn't flip. */
+        bool keep = true;
+        if (g_hd && g_frames != rendered_before) {
+            const u64 now = svcGetSystemTick();
+            if (g_hd_last_tick) {
+                const float ms = (float)(now - g_hd_last_tick) / ((float)SYSCLOCK_ARM11 / 1000.0f);
+                if (ms < 200.0f)
+                    g_hd_interval_ms = g_hd_interval_ms > 0.0f ? g_hd_interval_ms * 0.95f + ms * 0.05f : ms;
+            }
+            g_hd_last_tick = now;
+            if (g_hd_interval_ms > 0.0f) {
+                const bool halve = g_hd_halve ? g_hd_interval_ms < 26.0f : g_hd_interval_ms < 21.0f;
+                if (halve != g_hd_halve) {
+                    g_hd_halve = halve;
+                    diagnostic_log("MVD", "720p frames %u ms apart: showing %s", (unsigned)(g_hd_interval_ms + 0.5f),
+                                   halve ? "every second (60 -> 30)" : "every one (30)");
+                }
+            }
+            keep = !g_hd_halve || (++g_hd_decoded & 1);
+        }
         if (g_frames != rendered_before && keep) {
             g_output_state[target] = OUT_READY;
             g_output_bytes[target] = g_entry_size[slot];

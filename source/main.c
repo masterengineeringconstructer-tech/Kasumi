@@ -281,7 +281,9 @@ static void render_wide_video(bool draw_bottom)
          * ~28 ms on average, the next 60 fps frame is kept rather than the
          * one after: 17 ms less wait, one 50 ms step in the game instead of
          * 33. Kept clear of repeats, which a wait near 0 would bring. */
-        const bool xbox_hd = !sixty && mvd_video_hd();
+        /* Only while 60 is halved: a 30 fps game (issue #12) is paced like
+         * GeForce NOW's 30, surplus drain included. */
+        const bool xbox_hd = !sixty && mvd_video_hd_halving();
         if (present && xbox_hd) {
             const float age_ms = (float)mvd_video_ready_frame_age_us(0) / 1000.0f;
             hd_wait_ms = hd_wait_ms > 0.0f ? hd_wait_ms * 0.9f + age_ms * 0.1f : age_ms;

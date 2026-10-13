@@ -260,7 +260,10 @@ void xcloud_stream_on_data(WebRtcTransport *t, const char *data, size_t length, 
         diagnostic_log("XCLOUD", "message handshake answered");
     } else if (target && !strcmp(target, "/streaming/sessionLifetimeManagement/serverInitiatedDisconnect")) {
         x.disconnect_seen = true;
-        diagnostic_log("XCLOUD", "the service ended the stream");
+        /* Why, if it says (issue #12's sessions all ended this way). */
+        json_t *content = json_object_get(root, "content");
+        const char *why = json_is_string(content) ? json_string_value(content) : NULL;
+        diagnostic_log("XCLOUD", "the service ended the stream: %.200s", why && why[0] ? why : "-");
     }
     if (type && !strcmp(type, "TransactionStart") && id && strlen(id) < sizeof(x.pending[0]) &&
         x.pending_count < PENDING_MAX)
