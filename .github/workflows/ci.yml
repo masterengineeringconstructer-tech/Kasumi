@@ -14,62 +14,79 @@ jobs:
     container:
       image: devkitpro/devkitarm:latest
 
+    env:
+      DEVKITPRO: /opt/devkitpro
+      DEVKITARM: /opt/devkitpro/devkitARM
+      CTRULIB: /opt/devkitpro/libctru
+
     steps:
       - name: Checkout repository with Submodules
         uses: actions/checkout@v4
         with:
           submodules: 'recursive' # Vital for vendor and build-transport packages
 
-      - name: Install devkitPro 3DS Packages & Build Utilities
+      - name: Install System Build Essentials & Python
         run: |
-          # Sync database and install the required dependencies mentioned in Kasumi's README
-          # --noconfirm bypasses interactive prompts, --needed avoids reinstalling components
-          apt-get update && apt-get install -y wget unzip
+          # The container uses Arch Linux instead of Ubuntu, so we use pacman
           pacman -Syu --noconfirm
+          
+          # This maps your requested dependencies to Arch Linux alternatives:
+          # build-essential -> base-devel
+          # libarchive-tools -> libarchive
+          # libgtk-3-0 -> gtk3
+          pacman -S --needed --noconfirm \
+            git \
+            make \
+            cmake \
+            base-devel \
+            gcc \
+            g++ \
+            python \
+            python-pip \
+            wget \
+            unzip \
+            libarchive \
+            gtk3
+
+      - name: Install devkitPro 3DS SDK Packages
+        run: |
+          # Pull down Kasumi's dedicated 3DS tool requirements
           pacman -S --needed --noconfirm 3ds-dev 3ds-curl 3ds-jansson 3ds-mbedtls 3ds-libopus 3ds-cmake
 
-      - name: Download 3DS OS Toolchain Binaries (makerom & bannertool)
+      - name: Build and Install BannerTool from Source
         run: |
-          # Pull down makerom (v0.18.4)
-          wget https://github.com -O makerom.zip
-          unzip makerom.zip -d /usr/local/bin/
-          chmod +x /usr/local/bin/makerom
-
-          # Pull down bannertool (v1.2.0)
-          wget https://github.com -O bannertool.zip
-          unzip bannertool.zip -d /usr/local/bin/
-          # Fix case variant if extracted archive uses capitals
-          mv /usr/local/bin/bannertool* /usr/local/bin/bannertool || true
+          git clone https://github.com
+          cd 3ds-bannertool
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j$(nproc)
+          cp build/bannertool /usr/local/bin/bannertool
           chmod +x /usr/local/bin/bannertool
+          cd ..
 
-          # Clean archives
-          rm makerom.zip bannertool.zip
+      - name: Build and Install Makerom from Source
+        run: |
+          git clone --recursive https://github.com
+          cd Project_CTR/makerom
+          make deps
+          make -j$(nproc)
+          cp ./bin/makerom /usr/local/bin/makerom
+          chmod +x /usr/local/bin/makerom
+          cd ../..
 
       - name: Compile WebRTC Transport Layer
         run: |
-          # Setup global devkitPro environment vars inside the step process execution context
-          export DEVKITPRO=/opt/devkitpro
-          export DEVKITARM=$DEVKITPRO/devkitARM
-          export CTRULIB=$DEVKITPRO/libctru
           export PATH=$PATH:$DEVKITPRO/tools/bin
-
-          # Run the specific WebRTC initialization script noted in README
           bash tools/build-transport.sh
 
       - name: Compile Final O3DS CIA Package
         run: |
-          export DEVKITPRO=/opt/devkitpro
-          export DEVKITARM=$DEVKITPRO/devkitARM
-          export CTRULIB=$DEVKITPRO/libctru
           export PATH=$PATH:$DEVKITPRO/tools/bin
-
-          # Clear any legacy objects, build the raw 3DSX, then pack the modified CIA
           make clean
           make
           make cia MAKEROM=/usr/local/bin/makerom BANNERTOOL=/usr/local/bin/bannertool
 
       - name: Upload Custom O3DS CIA Artifact
-        uses: actions/artifacts@v4
+        uses: actions/upload-artifact@v4
         with:
           name: Kasumi-O3DS-ExtendedMemory
           path: ./*.cia
